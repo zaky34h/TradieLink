@@ -67,6 +67,44 @@ function mapUserRow(row) {
   };
 }
 
+async function loadUserByEmail(email) {
+  const result = await pool.query("SELECT * FROM users WHERE email = $1 LIMIT 1", [email]);
+  if (!result.rowCount) return null;
+  return mapUserRow(result.rows[0]);
+}
+
+function toInt(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function authRequired(req, res, next) {
+  (async () => {
+    try {
+      const authorization = req.headers.authorization || "";
+      if (!authorization.startsWith("Bearer ")) {
+        return res.status(401).json({ ok: false, error: "Missing bearer token." });
+      }
+
+      const token = authorization.slice("Bearer ".length).trim();
+      if (!token) return res.status(401).json({ ok: false, error: "Missing bearer token." });
+
+      const payload = jwt.verify(token, JWT_SECRET);
+      const email = String(payload?.email || "").trim().toLowerCase();
+      if (!email) return res.status(401).json({ ok: false, error: "Invalid token." });
+
+      const user = await loadUserByEmail(email);
+      if (!user) return res.status(401).json({ ok: false, error: "User not found." });
+
+      req.authUser = user;
+      return next();
+    } catch (error) {
+      return res.status(401).json({ ok: false, error: "Invalid or expired token." });
+    }
+  })();
+}
+
 async function initDb() {
   const initSqlPath = path.join(__dirname, "sql.init.sql");
   const initSql = fs.readFileSync(initSqlPath, "utf8");
@@ -207,6 +245,302 @@ app.post("/auth/login", async (req, res) => {
   } catch (error) {
     console.error("login error:", error);
     return res.status(500).json({ ok: false, error: "Login failed." });
+  }
+});
+
+app.get("/builders", authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, first_name, last_name, company_name
+       FROM users
+       WHERE role = 'builder'
+       ORDER BY COALESCE(company_name, ''), first_name, last_name`
+    );
+
+    const builders = result.rows.map((row) => ({
+      id: row.id,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      companyName: row.company_name,
+      displayName: row.company_name || `${row.first_name} ${row.last_name}`.trim(),
+    }));
+
+    return res.json({ ok: true, builders });
+  } catch (error) {
+    console.error("builders list error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load builders." });
+  }
+});
+
+app.get("/messages/threads", authRequired, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const role = req.authUser.role;
+
+    const query =
+      role === "builder"
+        ? `SELECT
+            t.id,
+            t.builder_id,
+            t.tradie_id,
+            t.created_at,
+            b.first_name AS builder_first_name,
+            b.last_name AS builder_last_name,
+            b.company_name AS builder_company_name,
+            tr.first_name AS tradie_first_name,
+            tr.last_name AS tradie_last_name,
+            tr.occupation AS tradie_occupation,
+            lm.body AS last_message_body,
+            lm.created_at AS last_message_at,
+            lm.sender_id AS last_message_sender_id
+          FROM chat_threads t
+          JOIN users b ON b.id = t.builder_id
+          JOIN users tr ON tr.id = t.tradie_id
+          LEFT JOIN LATERAL (
+            SELECT body, created_at, sender_id
+            FROM chat_messages m
+            WHERE m.thread_id = t.id
+            ORDER BY m.created_at DESC
+            LIMIT 1
+          ) lm ON TRUE
+          WHERE t.builder_id = $1
+          ORDER BY COALESCE(lm.created_at, t.created_at) DESC`
+        : `SELECT
+            t.id,
+            t.builder_id,
+            t.tradie_id,
+            t.created_at,
+            b.first_name AS builder_first_name,
+            b.last_name AS builder_last_name,
+            b.company_name AS builder_company_name,
+            tr.first_name AS tradie_first_name,
+            tr.last_name AS tradie_last_name,
+            tr.occupation AS tradie_occupation,
+            lm.body AS last_message_body,
+            lm.created_at AS last_message_at,
+            lm.sender_id AS last_message_sender_id
+          FROM chat_threads t
+          JOIN users b ON b.id = t.builder_id
+          JOIN users tr ON tr.id = t.tradie_id
+          LEFT JOIN LATERAL (
+            SELECT body, created_at, sender_id
+            FROM chat_messages m
+            WHERE m.thread_id = t.id
+            ORDER BY m.created_at DESC
+            LIMIT 1
+          ) lm ON TRUE
+          WHERE t.tradie_id = $1
+          ORDER BY COALESCE(lm.created_at, t.created_at) DESC`;
+
+    const result = await pool.query(query, [userId]);
+    const threads = result.rows.map((row) => ({
+      id: row.id,
+      builderId: row.builder_id,
+      tradieId: row.tradie_id,
+      createdAt: row.created_at,
+      participant:
+        role === "builder"
+          ? {
+              id: row.tradie_id,
+              role: "tradie",
+              name: `${row.tradie_first_name} ${row.tradie_last_name}`.trim(),
+              subtitle: row.tradie_occupation || "Tradie",
+            }
+          : {
+              id: row.builder_id,
+              role: "builder",
+              name:
+                row.builder_company_name ||
+                `${row.builder_first_name} ${row.builder_last_name}`.trim(),
+              subtitle: row.builder_company_name
+                ? `${row.builder_first_name} ${row.builder_last_name}`.trim()
+                : "Builder",
+            },
+      lastMessage: row.last_message_body || null,
+      lastMessageAt: row.last_message_at || row.created_at,
+      lastMessageSenderId: row.last_message_sender_id || null,
+    }));
+
+    return res.json({ ok: true, threads });
+  } catch (error) {
+    console.error("threads list error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load message threads." });
+  }
+});
+
+app.get("/messages/threads/:threadId", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.params.threadId);
+    if (!threadId) return res.status(400).json({ ok: false, error: "Invalid thread id." });
+
+    const threadResult = await pool.query(
+      `SELECT t.*, b.first_name AS builder_first_name, b.last_name AS builder_last_name,
+              b.company_name AS builder_company_name,
+              tr.first_name AS tradie_first_name, tr.last_name AS tradie_last_name, tr.occupation AS tradie_occupation
+       FROM chat_threads t
+       JOIN users b ON b.id = t.builder_id
+       JOIN users tr ON tr.id = t.tradie_id
+       WHERE t.id = $1
+       LIMIT 1`,
+      [threadId]
+    );
+
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    const messagesResult = await pool.query(
+      `SELECT m.id, m.thread_id, m.sender_id, m.body, m.created_at,
+              u.first_name, u.last_name, u.role
+       FROM chat_messages m
+       JOIN users u ON u.id = m.sender_id
+       WHERE m.thread_id = $1
+       ORDER BY m.created_at ASC`,
+      [threadId]
+    );
+
+    const messages = messagesResult.rows.map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      senderId: row.sender_id,
+      senderRole: row.role,
+      senderName: `${row.first_name} ${row.last_name}`.trim(),
+      body: row.body,
+      createdAt: row.created_at,
+    }));
+
+    const payload = {
+      id: thread.id,
+      builderId: thread.builder_id,
+      tradieId: thread.tradie_id,
+      createdAt: thread.created_at,
+      builder: {
+        id: thread.builder_id,
+        name:
+          thread.builder_company_name ||
+          `${thread.builder_first_name} ${thread.builder_last_name}`.trim(),
+      },
+      tradie: {
+        id: thread.tradie_id,
+        name: `${thread.tradie_first_name} ${thread.tradie_last_name}`.trim(),
+        occupation: thread.tradie_occupation || null,
+      },
+    };
+
+    return res.json({ ok: true, thread: payload, messages });
+  } catch (error) {
+    console.error("thread detail error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load thread." });
+  }
+});
+
+app.post("/messages/threads", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "tradie") {
+      return res.status(403).json({ ok: false, error: "Only tradies can start new chats." });
+    }
+
+    const builderId = toInt(req.body.builderId);
+    if (!builderId) {
+      return res.status(400).json({ ok: false, error: "builderId is required." });
+    }
+
+    const builderResult = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND role = 'builder' LIMIT 1",
+      [builderId]
+    );
+    if (!builderResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Builder not found." });
+    }
+
+    const threadResult = await pool.query(
+      `INSERT INTO chat_threads (builder_id, tradie_id)
+       VALUES ($1, $2)
+       ON CONFLICT (builder_id, tradie_id)
+       DO UPDATE SET builder_id = EXCLUDED.builder_id
+       RETURNING *`,
+      [builderId, req.authUser.id]
+    );
+
+    const thread = threadResult.rows[0];
+    const initialBody = String(req.body.message || "").trim();
+    let message = null;
+
+    if (initialBody) {
+      const messageResult = await pool.query(
+        `INSERT INTO chat_messages (thread_id, sender_id, body)
+         VALUES ($1, $2, $3)
+         RETURNING id, thread_id, sender_id, body, created_at`,
+        [thread.id, req.authUser.id, initialBody]
+      );
+      message = messageResult.rows[0];
+    }
+
+    return res.status(201).json({
+      ok: true,
+      thread: {
+        id: thread.id,
+        builderId: thread.builder_id,
+        tradieId: thread.tradie_id,
+        createdAt: thread.created_at,
+      },
+      message,
+    });
+  } catch (error) {
+    console.error("create thread error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to create message thread." });
+  }
+});
+
+app.post("/messages/threads/:threadId/messages", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.params.threadId);
+    if (!threadId) return res.status(400).json({ ok: false, error: "Invalid thread id." });
+
+    const body = String(req.body.body || "").trim();
+    if (!body) return res.status(400).json({ ok: false, error: "Message body is required." });
+
+    const threadResult = await pool.query(
+      "SELECT id, builder_id, tradie_id FROM chat_threads WHERE id = $1 LIMIT 1",
+      [threadId]
+    );
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    const messageResult = await pool.query(
+      `INSERT INTO chat_messages (thread_id, sender_id, body)
+       VALUES ($1, $2, $3)
+       RETURNING id, thread_id, sender_id, body, created_at`,
+      [threadId, userId, body]
+    );
+
+    const message = messageResult.rows[0];
+    return res.status(201).json({
+      ok: true,
+      message: {
+        id: message.id,
+        threadId: message.thread_id,
+        senderId: message.sender_id,
+        body: message.body,
+        createdAt: message.created_at,
+      },
+    });
+  } catch (error) {
+    console.error("send message error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to send message." });
   }
 });
 
