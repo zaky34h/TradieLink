@@ -48,6 +48,15 @@ function splitCertifications(value) {
     .filter(Boolean);
 }
 
+function splitTradesNeeded(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
+  return String(value)
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 function mapUserRow(row) {
   return {
     id: row.id,
@@ -64,6 +73,32 @@ function mapUserRow(row) {
     photoUrl: row.photo_url,
     email: row.email,
     createdAt: row.created_at,
+  };
+}
+
+function mapBuilderJobRow(row, tradieById = new Map()) {
+  const enquiryTradieIds = Array.isArray(row.enquiry_tradie_ids)
+    ? row.enquiry_tradie_ids.map((id) => toInt(id)).filter(Boolean)
+    : [];
+  return {
+    id: row.id,
+    builderId: row.builder_id,
+    title: row.title,
+    location: row.location || "",
+    tradesNeeded: row.trades_needed || [],
+    details: row.details || "",
+    status: row.status,
+    interestedTradies: row.interested_tradies || [],
+    enquiries: enquiryTradieIds
+      .map((tradieId) => tradieById.get(tradieId))
+      .filter(Boolean)
+      .map((tradie) => ({
+        id: tradie.id,
+        name: `${tradie.first_name} ${tradie.last_name}`.trim(),
+        occupation: tradie.occupation || null,
+      })),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -248,6 +283,336 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+app.get("/me/stats", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "builder") {
+      return res.status(403).json({ ok: false, error: "Only builders can access dashboard stats." });
+    }
+
+    const builderId = req.authUser.id;
+    const [chatResult, jobsResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*)::int AS thread_count,
+           COUNT(DISTINCT tradie_id)::int AS saved_tradies
+         FROM chat_threads
+         WHERE builder_id = $1`,
+        [builderId]
+      ),
+      pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'posted')::int AS posted_count,
+           COUNT(*) FILTER (WHERE status = 'inProgress')::int AS in_progress_count
+         FROM builder_jobs
+         WHERE builder_id = $1`,
+        [builderId]
+      ),
+    ]);
+
+    const chatRow = chatResult.rows[0] || {};
+    const jobsRow = jobsResult.rows[0] || {};
+    return res.json({
+      ok: true,
+      stats: {
+        activeChats: Number(chatRow.thread_count || 0),
+        pendingOffers: Number(jobsRow.posted_count || 0),
+        savedTradies: Number(chatRow.saved_tradies || 0),
+        pendingPay: Number(jobsRow.in_progress_count || 0),
+      },
+    });
+  } catch (error) {
+    console.error("builder stats error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load dashboard stats." });
+  }
+});
+
+app.get("/builder/jobs", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "builder") {
+      return res.status(403).json({ ok: false, error: "Only builders can access jobs." });
+    }
+
+    const result = await pool.query(
+      `SELECT *
+       FROM builder_jobs
+       WHERE builder_id = $1
+       ORDER BY created_at DESC`,
+      [req.authUser.id]
+    );
+
+    const tradieIds = Array.from(
+      new Set(
+        result.rows
+          .flatMap((row) => (Array.isArray(row.enquiry_tradie_ids) ? row.enquiry_tradie_ids : []))
+          .map((id) => toInt(id))
+          .filter(Boolean)
+      )
+    );
+
+    let tradieById = new Map();
+    if (tradieIds.length) {
+      const tradieResult = await pool.query(
+        `SELECT id, first_name, last_name, occupation
+         FROM users
+         WHERE role = 'tradie' AND id = ANY($1::int[])`,
+        [tradieIds]
+      );
+      tradieById = new Map(tradieResult.rows.map((row) => [row.id, row]));
+    }
+
+    return res.json({ ok: true, jobs: result.rows.map((row) => mapBuilderJobRow(row, tradieById)) });
+  } catch (error) {
+    console.error("builder jobs list error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load jobs." });
+  }
+});
+
+app.post("/builder/jobs", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "builder") {
+      return res.status(403).json({ ok: false, error: "Only builders can create jobs." });
+    }
+
+    const title = String(req.body.title || "").trim();
+    const location = String(req.body.location || "").trim() || null;
+    const tradesNeeded = splitTradesNeeded(req.body.tradesNeeded);
+    const details = String(req.body.details || "").trim() || null;
+    const statusInput = String(req.body.status || "posted").trim();
+    const status = ["posted", "inProgress", "done"].includes(statusInput) ? statusInput : null;
+
+    if (!title) return res.status(400).json({ ok: false, error: "Job title is required." });
+    if (!status) return res.status(400).json({ ok: false, error: "Invalid job status." });
+
+    const result = await pool.query(
+      `INSERT INTO builder_jobs (builder_id, title, location, trades_needed, details, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [req.authUser.id, title, location, tradesNeeded, details, status]
+    );
+
+    return res.status(201).json({ ok: true, job: mapBuilderJobRow(result.rows[0]) });
+  } catch (error) {
+    console.error("builder create job error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to create job." });
+  }
+});
+
+app.get("/jobs", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "tradie") {
+      return res.status(403).json({ ok: false, error: "Only tradies can browse posted jobs." });
+    }
+
+    const result = await pool.query(
+      `SELECT
+         j.*,
+         b.first_name AS builder_first_name,
+         b.last_name AS builder_last_name,
+         b.company_name AS builder_company_name
+       FROM builder_jobs j
+       JOIN users b ON b.id = j.builder_id
+       WHERE j.status = 'posted'
+       ORDER BY j.created_at DESC`
+    );
+
+    const jobs = result.rows.map((row) => {
+      const enquiryTradieIds = Array.isArray(row.enquiry_tradie_ids)
+        ? row.enquiry_tradie_ids.map((id) => toInt(id)).filter(Boolean)
+        : [];
+      const hasEnquired = enquiryTradieIds.includes(req.authUser.id);
+
+      return {
+        id: row.id,
+        builderId: row.builder_id,
+        builderDisplayName:
+          row.builder_company_name || `${row.builder_first_name} ${row.builder_last_name}`.trim(),
+        title: row.title,
+        location: row.location || "",
+        tradesNeeded: row.trades_needed || [],
+        details: row.details || "",
+        status: row.status,
+        hasEnquired,
+        enquiriesCount: enquiryTradieIds.length,
+        createdAt: row.created_at,
+      };
+    });
+
+    return res.json({ ok: true, jobs });
+  } catch (error) {
+    console.error("tradie jobs list error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load posted jobs." });
+  }
+});
+
+app.post("/jobs/:jobId/enquire", authRequired, async (req, res) => {
+  try {
+    if (req.authUser.role !== "tradie") {
+      return res.status(403).json({ ok: false, error: "Only tradies can enquire on jobs." });
+    }
+
+    const jobId = toInt(req.params.jobId);
+    if (!jobId) return res.status(400).json({ ok: false, error: "Invalid job id." });
+
+    const tradieName = `${req.authUser.firstName || ""} ${req.authUser.lastName || ""}`.trim() || "Tradie";
+
+    const result = await pool.query(
+      `UPDATE builder_jobs
+       SET enquiry_tradie_ids = CASE
+             WHEN $2 = ANY(enquiry_tradie_ids) THEN enquiry_tradie_ids
+             ELSE array_append(enquiry_tradie_ids, $2)
+           END,
+           interested_tradies = CASE
+             WHEN $3 = ANY(interested_tradies) THEN interested_tradies
+             ELSE array_append(interested_tradies, $3)
+           END,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'posted'
+       RETURNING id, enquiry_tradie_ids, interested_tradies`,
+      [jobId, req.authUser.id, tradieName]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: "Posted job not found." });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      job: {
+        id: result.rows[0].id,
+        enquiryTradieIds: result.rows[0].enquiry_tradie_ids || [],
+        interestedTradies: result.rows[0].interested_tradies || [],
+      },
+    });
+  } catch (error) {
+    console.error("tradie enquire job error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to submit enquiry." });
+  }
+});
+
+app.put("/me", authRequired, async (req, res) => {
+  try {
+    const currentResult = await pool.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [req.authUser.id]);
+    if (!currentResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    const current = currentResult.rows[0];
+    const role = current.role;
+
+    const firstName =
+      req.body.firstName === undefined ? current.first_name : String(req.body.firstName || "").trim();
+    const lastName =
+      req.body.lastName === undefined ? current.last_name : String(req.body.lastName || "").trim();
+    const about = req.body.about === undefined ? current.about : String(req.body.about || "").trim();
+    const email =
+      req.body.email === undefined
+        ? current.email
+        : String(req.body.email || "").trim().toLowerCase();
+
+    const companyName =
+      req.body.companyName === undefined
+        ? current.company_name
+        : String(req.body.companyName || "").trim() || null;
+    const address =
+      req.body.address === undefined ? current.address : String(req.body.address || "").trim() || null;
+
+    const occupation =
+      req.body.occupation === undefined
+        ? current.occupation
+        : String(req.body.occupation || "").trim() || null;
+    const pricePerHour =
+      req.body.pricePerHour === undefined ? current.price_per_hour : asNumberOrNull(req.body.pricePerHour);
+    const experienceYears =
+      req.body.experienceYears === undefined
+        ? current.experience_years
+        : asNumberOrNull(req.body.experienceYears);
+    const certifications =
+      req.body.certifications === undefined ? current.certifications || [] : splitCertifications(req.body.certifications);
+    const photoUrl =
+      req.body.photoUrl === undefined ? current.photo_url : String(req.body.photoUrl || "").trim() || null;
+
+    if (!firstName || !lastName || !about || !email) {
+      return res.status(400).json({ ok: false, error: "firstName, lastName, about and email are required." });
+    }
+
+    if (role === "builder" && (!companyName || !address)) {
+      return res.status(400).json({ ok: false, error: "Builder requires company name and address." });
+    }
+
+    if (role === "tradie") {
+      if (!occupation) return res.status(400).json({ ok: false, error: "Tradie occupation is required." });
+      if (pricePerHour === null || Number(pricePerHour) <= 0) {
+        return res.status(400).json({ ok: false, error: "Tradie pricePerHour must be greater than 0." });
+      }
+      if (experienceYears === null || Number(experienceYears) < 0) {
+        return res.status(400).json({ ok: false, error: "Tradie experienceYears must be 0 or more." });
+      }
+      if (!Array.isArray(certifications) || !certifications.length) {
+        return res.status(400).json({ ok: false, error: "At least one certification is required." });
+      }
+    }
+
+    if (email !== current.email) {
+      const emailConflictResult = await pool.query("SELECT id FROM users WHERE email = $1 AND id <> $2 LIMIT 1", [
+        email,
+        current.id,
+      ]);
+      if (emailConflictResult.rowCount) {
+        return res.status(409).json({ ok: false, error: "Email already registered." });
+      }
+    }
+
+    let passwordHash = current.password_hash;
+    if (req.body.password !== undefined) {
+      const password = String(req.body.password || "");
+      if (!password || password.length < 6) {
+        return res.status(400).json({ ok: false, error: "Password must be at least 6 characters." });
+      }
+      passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE users
+       SET first_name = $1,
+           last_name = $2,
+           about = $3,
+           company_name = $4,
+           address = $5,
+           occupation = $6,
+           price_per_hour = $7,
+           experience_years = $8,
+           certifications = $9,
+           photo_url = $10,
+           email = $11,
+           password_hash = $12
+       WHERE id = $13
+       RETURNING *`,
+      [
+        firstName,
+        lastName,
+        about,
+        companyName,
+        address,
+        occupation,
+        pricePerHour,
+        experienceYears,
+        certifications,
+        photoUrl,
+        email,
+        passwordHash,
+        current.id,
+      ]
+    );
+
+    const user = mapUserRow(updateResult.rows[0]);
+    const token = jwt.sign({ email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ ok: true, token, user });
+  } catch (error) {
+    console.error("update profile error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to update profile." });
+  }
+});
+
 app.get("/builders", authRequired, async (req, res) => {
   try {
     const result = await pool.query(
@@ -272,10 +637,40 @@ app.get("/builders", authRequired, async (req, res) => {
   }
 });
 
+app.get("/tradies", authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, first_name, last_name, occupation
+       FROM users
+       WHERE role = 'tradie'
+       ORDER BY first_name, last_name`
+    );
+
+    const tradies = result.rows.map((row) => ({
+      id: row.id,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      occupation: row.occupation,
+      displayName: `${row.first_name} ${row.last_name}`.trim(),
+    }));
+
+    return res.json({ ok: true, tradies });
+  } catch (error) {
+    console.error("tradies list error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load tradies." });
+  }
+});
+
+function getPeerIdFromThreadRow(thread, userId) {
+  return thread.builder_id === userId ? thread.tradie_id : thread.builder_id;
+}
+
 app.get("/messages/threads", authRequired, async (req, res) => {
   try {
     const userId = req.authUser.id;
     const role = req.authUser.role;
+    const view = String(req.query.view || "active").toLowerCase();
+    const historyMode = view === "history";
 
     const query =
       role === "builder"
@@ -303,8 +698,7 @@ app.get("/messages/threads", authRequired, async (req, res) => {
             ORDER BY m.created_at DESC
             LIMIT 1
           ) lm ON TRUE
-          WHERE t.builder_id = $1
-          ORDER BY COALESCE(lm.created_at, t.created_at) DESC`
+          WHERE t.builder_id = $1`
         : `SELECT
             t.id,
             t.builder_id,
@@ -329,38 +723,81 @@ app.get("/messages/threads", authRequired, async (req, res) => {
             ORDER BY m.created_at DESC
             LIMIT 1
           ) lm ON TRUE
-          WHERE t.tradie_id = $1
-          ORDER BY COALESCE(lm.created_at, t.created_at) DESC`;
+          WHERE t.tradie_id = $1`;
 
-    const result = await pool.query(query, [userId]);
-    const threads = result.rows.map((row) => ({
-      id: row.id,
-      builderId: row.builder_id,
-      tradieId: row.tradie_id,
-      createdAt: row.created_at,
-      participant:
-        role === "builder"
-          ? {
-              id: row.tradie_id,
-              role: "tradie",
-              name: `${row.tradie_first_name} ${row.tradie_last_name}`.trim(),
-              subtitle: row.tradie_occupation || "Tradie",
-            }
-          : {
-              id: row.builder_id,
-              role: "builder",
-              name:
-                row.builder_company_name ||
-                `${row.builder_first_name} ${row.builder_last_name}`.trim(),
-              subtitle: row.builder_company_name
-                ? `${row.builder_first_name} ${row.builder_last_name}`.trim()
-                : "Builder",
-            },
-      lastMessage: row.last_message_body || null,
-      lastMessageAt: row.last_message_at || row.created_at,
-      lastMessageSenderId: row.last_message_sender_id || null,
-    }));
+    const [threadsResult, closuresResult, unreadResult] = await Promise.all([
+      pool.query(query, [userId]),
+      pool.query(
+        `SELECT peer_id, closed_at
+         FROM chat_thread_closures
+         WHERE user_id = $1`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT m.thread_id, COUNT(*)::int AS unread_count
+         FROM chat_messages m
+         JOIN chat_threads t ON t.id = m.thread_id
+         LEFT JOIN chat_thread_reads r
+           ON r.user_id = $1
+          AND r.peer_id = CASE WHEN t.builder_id = $1 THEN t.tradie_id ELSE t.builder_id END
+         WHERE (t.builder_id = $1 OR t.tradie_id = $1)
+           AND m.sender_id <> $1
+           AND m.created_at > COALESCE(r.last_read_at, TO_TIMESTAMP(0))
+         GROUP BY m.thread_id`,
+        [userId]
+      ),
+    ]);
 
+    const closedAtByPeer = new Map(
+      closuresResult.rows.map((row) => [row.peer_id, row.closed_at ? new Date(row.closed_at).getTime() : 0])
+    );
+    const unreadByThread = new Map(unreadResult.rows.map((row) => [row.thread_id, Number(row.unread_count || 0)]));
+
+    const threads = [];
+    for (const row of threadsResult.rows) {
+      const peerId = getPeerIdFromThreadRow(row, userId);
+      const lastMessageAtMs = row.last_message_at
+        ? new Date(row.last_message_at).getTime()
+        : new Date(row.created_at).getTime();
+      const closedAtMs = Number(closedAtByPeer.get(peerId) || 0);
+
+      if (historyMode) {
+        if (!closedAtMs || lastMessageAtMs > closedAtMs) continue;
+      } else if (closedAtMs && lastMessageAtMs <= closedAtMs) {
+        continue;
+      }
+
+      threads.push({
+        id: row.id,
+        builderId: row.builder_id,
+        tradieId: row.tradie_id,
+        createdAt: row.created_at,
+        participant:
+          role === "builder"
+            ? {
+                id: row.tradie_id,
+                role: "tradie",
+                name: `${row.tradie_first_name} ${row.tradie_last_name}`.trim(),
+                subtitle: row.tradie_occupation || "Tradie",
+              }
+            : {
+                id: row.builder_id,
+                role: "builder",
+                name:
+                  row.builder_company_name ||
+                  `${row.builder_first_name} ${row.builder_last_name}`.trim(),
+                subtitle: row.builder_company_name
+                  ? `${row.builder_first_name} ${row.builder_last_name}`.trim()
+                  : "Builder",
+              },
+        lastMessage: row.last_message_body || (historyMode ? "Chat closed" : null),
+        lastMessageAt: row.last_message_at || row.created_at,
+        lastMessageSenderId: row.last_message_sender_id || null,
+        unreadCount: historyMode ? 0 : Number(unreadByThread.get(row.id) || 0),
+      });
+    }
+
+    threads.sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime());
     return res.json({ ok: true, threads });
   } catch (error) {
     console.error("threads list error:", error);
@@ -442,21 +879,34 @@ app.get("/messages/threads/:threadId", authRequired, async (req, res) => {
 
 app.post("/messages/threads", authRequired, async (req, res) => {
   try {
-    if (req.authUser.role !== "tradie") {
-      return res.status(403).json({ ok: false, error: "Only tradies can start new chats." });
+    let builderId = null;
+    let tradieId = null;
+
+    if (req.authUser.role === "tradie") {
+      builderId = toInt(req.body.builderId);
+      tradieId = req.authUser.id;
+      if (!builderId) {
+        return res.status(400).json({ ok: false, error: "builderId is required." });
+      }
+    } else if (req.authUser.role === "builder") {
+      tradieId = toInt(req.body.tradieId);
+      builderId = req.authUser.id;
+      if (!tradieId) {
+        return res.status(400).json({ ok: false, error: "tradieId is required." });
+      }
+    } else {
+      return res.status(403).json({ ok: false, error: "Invalid user role." });
     }
 
-    const builderId = toInt(req.body.builderId);
-    if (!builderId) {
-      return res.status(400).json({ ok: false, error: "builderId is required." });
-    }
-
-    const builderResult = await pool.query(
-      "SELECT id FROM users WHERE id = $1 AND role = 'builder' LIMIT 1",
-      [builderId]
-    );
+    const [builderResult, tradieResult] = await Promise.all([
+      pool.query("SELECT id FROM users WHERE id = $1 AND role = 'builder' LIMIT 1", [builderId]),
+      pool.query("SELECT id FROM users WHERE id = $1 AND role = 'tradie' LIMIT 1", [tradieId]),
+    ]);
     if (!builderResult.rowCount) {
       return res.status(404).json({ ok: false, error: "Builder not found." });
+    }
+    if (!tradieResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Tradie not found." });
     }
 
     const threadResult = await pool.query(
@@ -465,7 +915,7 @@ app.post("/messages/threads", authRequired, async (req, res) => {
        ON CONFLICT (builder_id, tradie_id)
        DO UPDATE SET builder_id = EXCLUDED.builder_id
        RETURNING *`,
-      [builderId, req.authUser.id]
+      [builderId, tradieId]
     );
 
     const thread = threadResult.rows[0];
@@ -527,6 +977,15 @@ app.post("/messages/threads/:threadId/messages", authRequired, async (req, res) 
       [threadId, userId, body]
     );
 
+    const peerId = thread.builder_id === userId ? thread.tradie_id : thread.builder_id;
+    await pool.query(
+      `INSERT INTO chat_typing (from_user_id, to_user_id, is_typing, updated_at)
+       VALUES ($1, $2, FALSE, NOW())
+       ON CONFLICT (from_user_id, to_user_id)
+       DO UPDATE SET is_typing = EXCLUDED.is_typing, updated_at = EXCLUDED.updated_at`,
+      [userId, peerId]
+    );
+
     const message = messageResult.rows[0];
     return res.status(201).json({
       ok: true,
@@ -541,6 +1000,158 @@ app.post("/messages/threads/:threadId/messages", authRequired, async (req, res) 
   } catch (error) {
     console.error("send message error:", error);
     return res.status(500).json({ ok: false, error: "Failed to send message." });
+  }
+});
+
+app.post("/messages/read", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.body.threadId);
+    if (!threadId) return res.status(400).json({ ok: false, error: "threadId is required." });
+
+    const threadResult = await pool.query(
+      "SELECT id, builder_id, tradie_id FROM chat_threads WHERE id = $1 LIMIT 1",
+      [threadId]
+    );
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    const peerId = thread.builder_id === userId ? thread.tradie_id : thread.builder_id;
+    await pool.query(
+      `INSERT INTO chat_thread_reads (user_id, peer_id, last_read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, peer_id)
+       DO UPDATE SET last_read_at = EXCLUDED.last_read_at`,
+      [userId, peerId]
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("mark read error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to mark thread as read." });
+  }
+});
+
+app.post("/messages/threads/:threadId/close", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.params.threadId);
+    if (!threadId) return res.status(400).json({ ok: false, error: "Invalid thread id." });
+
+    const threadResult = await pool.query(
+      "SELECT id, builder_id, tradie_id FROM chat_threads WHERE id = $1 LIMIT 1",
+      [threadId]
+    );
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    await pool.query(
+      `INSERT INTO chat_thread_closures (user_id, peer_id, closed_at)
+       VALUES ($1, $2, NOW()), ($2, $1, NOW())
+       ON CONFLICT (user_id, peer_id)
+       DO UPDATE SET closed_at = EXCLUDED.closed_at`,
+      [thread.builder_id, thread.tradie_id]
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("close thread error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to close thread." });
+  }
+});
+
+app.post("/messages/typing", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.body.threadId);
+    const isTyping = Boolean(req.body.isTyping);
+    if (!threadId) return res.status(400).json({ ok: false, error: "threadId is required." });
+
+    const threadResult = await pool.query(
+      "SELECT id, builder_id, tradie_id FROM chat_threads WHERE id = $1 LIMIT 1",
+      [threadId]
+    );
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    const peerId = thread.builder_id === userId ? thread.tradie_id : thread.builder_id;
+    await pool.query(
+      `INSERT INTO chat_typing (from_user_id, to_user_id, is_typing, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (from_user_id, to_user_id)
+       DO UPDATE SET is_typing = EXCLUDED.is_typing, updated_at = EXCLUDED.updated_at`,
+      [userId, peerId, isTyping]
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("typing update error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to update typing state." });
+  }
+});
+
+app.get("/messages/typing/:threadId", authRequired, async (req, res) => {
+  try {
+    const threadId = toInt(req.params.threadId);
+    if (!threadId) return res.status(400).json({ ok: false, error: "Invalid thread id." });
+
+    const threadResult = await pool.query(
+      "SELECT id, builder_id, tradie_id FROM chat_threads WHERE id = $1 LIMIT 1",
+      [threadId]
+    );
+    if (!threadResult.rowCount) {
+      return res.status(404).json({ ok: false, error: "Thread not found." });
+    }
+
+    const thread = threadResult.rows[0];
+    const userId = req.authUser.id;
+    if (thread.builder_id !== userId && thread.tradie_id !== userId) {
+      return res.status(403).json({ ok: false, error: "You do not have access to this thread." });
+    }
+
+    const peerId = thread.builder_id === userId ? thread.tradie_id : thread.builder_id;
+    const freshAfter = Date.now() - 10_000;
+    const typingResult = await pool.query(
+      `SELECT from_user_id, to_user_id, is_typing
+       FROM chat_typing
+       WHERE (
+         (from_user_id = $1 AND to_user_id = $2)
+         OR (from_user_id = $2 AND to_user_id = $1)
+       )
+       AND updated_at >= TO_TIMESTAMP($3 / 1000.0)`,
+      [userId, peerId, freshAfter]
+    );
+
+    let meTyping = false;
+    let peerTyping = false;
+    for (const row of typingResult.rows) {
+      const active = Boolean(row.is_typing);
+      if (row.from_user_id === userId && row.to_user_id === peerId) meTyping = active;
+      if (row.from_user_id === peerId && row.to_user_id === userId) peerTyping = active;
+    }
+
+    return res.json({ ok: true, meTyping, peerTyping, eitherTyping: meTyping || peerTyping });
+  } catch (error) {
+    console.error("typing status error:", error);
+    return res.status(500).json({ ok: false, error: "Failed to load typing status." });
   }
 });
 
