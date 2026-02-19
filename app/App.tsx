@@ -6,10 +6,10 @@ import { ErrorBoundary } from './components/core/ErrorBoundary';
 import { styles } from './styles';
 
 function AppShell() {
-  const { useLightTheme } = useApp();
+  const { useLightTheme, isLogin } = useApp();
 
   return (
-    <SafeAreaView style={[styles.safe, useLightTheme && styles.safeLight]}>
+    <SafeAreaView style={[styles.safe, useLightTheme && styles.safeLight, isLogin && styles.safeLogin]}>
       <StatusBar style={useLightTheme ? 'dark' : 'light'} />
       <AppNavigator />
     </SafeAreaView>
