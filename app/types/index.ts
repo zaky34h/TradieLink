@@ -111,3 +111,28 @@ export type TradieJobBoardItem = {
   enquiriesCount: number;
   createdAt: string;
 };
+
+export type TradieQuoteLineItem = {
+  description: string;
+  quantity: number;
+  unitPrice: number;
+};
+
+export type TradieQuote = {
+  id: number;
+  quoteNumber: string;
+  jobId: number;
+  jobTitle: string;
+  builderDisplayName: string;
+  siteAddress: string;
+  scope: string;
+  lineItems: TradieQuoteLineItem[];
+  subtotal: number;
+  gst: number;
+  total: number;
+  validForDays: number;
+  notes: string;
+  status: QuoteStatus;
+  createdAt: string;
+  pdfUri: string | null;
+};

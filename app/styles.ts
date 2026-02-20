@@ -658,6 +658,16 @@ export const styles = StyleSheet.create({
     color: '#111111',
     fontWeight: '800',
   },
+  quoteCornerAddButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#111111',
+    backgroundColor: BRAND_BLUE,
+  },
   jobsStatusTabs: {
     flexDirection: 'row',
     backgroundColor: '#F3F4F6',
@@ -899,6 +909,12 @@ export const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     padding: 14,
   },
+  quoteModalScroll: {
+    maxHeight: '92%',
+  },
+  quoteModalContent: {
+    paddingBottom: 8,
+  },
   modalCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 18,
@@ -991,5 +1007,64 @@ export const styles = StyleSheet.create({
   modalButtonPrimaryText: {
     color: BRAND_BLUE,
     fontWeight: '800',
+  },
+  quoteItemsWrap: {
+    gap: 8,
+  },
+  quoteItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  quoteItemDescription: {
+    flex: 1,
+  },
+  quoteItemSmallInput: {
+    width: 74,
+    textAlign: 'center',
+  },
+  quoteItemDeleteBtn: {
+    width: 34,
+    height: 34,
+    borderWidth: 1,
+    borderColor: '#111111',
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+  },
+  quoteAddItemBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: '#111111',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: '#DDF1FF',
+  },
+  quoteAddItemText: {
+    color: '#111111',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  quoteTotalsWrap: {
+    borderWidth: 1,
+    borderColor: '#111111',
+    borderRadius: 10,
+    padding: 10,
+    gap: 3,
+    backgroundColor: '#F9FAFB',
+  },
+  quoteTotalText: {
+    color: '#333333',
+    fontWeight: '600',
+  },
+  quoteTotalMain: {
+    color: '#111111',
+    fontWeight: '900',
+    fontSize: 15,
   },
 });

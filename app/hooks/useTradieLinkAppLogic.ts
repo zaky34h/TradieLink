@@ -15,6 +15,7 @@ import type {
   ThreadMessage,
   TradeOption,
   TradieJobBoardItem,
+  TradieQuote,
   TradieTab,
   TradieDirectoryItem,
 } from '../types';
@@ -81,6 +82,7 @@ export function useTradieLinkAppLogic() {
   const [directoryBuilders, setDirectoryBuilders] = useState<BuilderDirectoryItem[]>([]);
   const [directoryTradies, setDirectoryTradies] = useState<TradieDirectoryItem[]>([]);
   const [tradieJobs, setTradieJobs] = useState<TradieJobBoardItem[]>([]);
+  const [tradieQuotes, setTradieQuotes] = useState<TradieQuote[]>([]);
   const [selectedTradieJobId, setSelectedTradieJobId] = useState<number | null>(null);
   const typingStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -223,6 +225,7 @@ export function useTradieLinkAppLogic() {
     setDirectoryBuilders([]);
     setDirectoryTradies([]);
     setTradieJobs([]);
+    setTradieQuotes([]);
     setSelectedTradieJobId(null);
     setBuilderStats(EMPTY_BUILDER_STATS);
     setJobs([]);
@@ -357,6 +360,10 @@ export function useTradieLinkAppLogic() {
     } catch (error) {
       Alert.alert('Could not enquire', error instanceof Error ? error.message : 'Unable to submit enquiry.');
     }
+  };
+
+  const addTradieQuote = (quote: TradieQuote) => {
+    setTradieQuotes((current) => [quote, ...current]);
   };
 
   const loadThreadMessages = async (threadId: number, markRead = true) => {
@@ -698,6 +705,8 @@ export function useTradieLinkAppLogic() {
     directoryBuilders,
     directoryTradies,
     tradieJobs,
+    tradieQuotes,
+    addTradieQuote,
     selectedTradieJobId,
     setSelectedTradieJobId,
     selectedTradieJob,

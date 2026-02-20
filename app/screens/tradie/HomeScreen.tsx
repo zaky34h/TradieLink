@@ -37,8 +37,8 @@ export function TradieHomeScreen() {
           onPress={() => setTradieTab('messages')}
         />
         <BuilderActionButton
-          label="View Quotes"
-          subtitle="Review pending, approved, and declined quotes"
+          label="Create Quote"
+          subtitle="Create and manage pending, approved, and declined quotes"
           tone="brand"
           onPress={() => setTradieTab('quotes')}
         />
